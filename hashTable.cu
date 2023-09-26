@@ -5,7 +5,10 @@
 #include <thrust/sequence.h>
 #include <thrust/shuffle.h>
 #include <thrust/random.h>
+#include <thrust/sort.h>
 #include <thrust/execution_policy.h>
+
+#define BINARY_SEARCH
 
 #define CUDA_TRY(call)                                                          \
   do {                                                                          \
@@ -24,16 +27,18 @@ struct KeyT{
         ptr[1] = v2;
     }
     __device__ __host__ bool operator == (const KeyT key) {
-        //int64_t* d1 = static_cast<int64_t *>((void *)data);
-        //int64_t* d2 = static_cast<int64_t *>((void *)(data + 8));
-        //int64_t* _d1 = static_cast<int64_t *>((void *)k.data);
-        //int64_t* _d2 = static_cast<int64_t *>((void*)(k.data + 8));
-        //return d1[0] == _d1[0] && d2[0] == _d2[0];
         int64_t* d1 = (int64_t *)key.data;
         int64_t* d2 = (int64_t *)(key.data + 8);
         int64_t* _d1 = (int64_t *)data;
         int64_t* _d2 = (int64_t *)(data + 8);
         return (d1[0] == _d1[0] && d2[0] == _d2[0]) ? true : false;
+    }
+    __device__ __host__ bool operator < (const KeyT key) const {
+        int64_t* d1 = (int64_t *)key.data;
+        int64_t* d2 = (int64_t *)(key.data + 8);
+        int64_t* _d1 = (int64_t *)data;
+        int64_t* _d2 = (int64_t *)(data + 8);
+        return (_d1[0] < d1[0]) ||  (_d1[0] == d1[0] && _d2[0] < d2[0]);
     }
     __device__ __host__ void print(int matched) {
 	    int* ptr = (int*)data;
@@ -44,7 +49,9 @@ struct KeyT{
 struct ValueT{
     char data[32];
 };
+
 #define ValueBytes 32
+#define cg_size 8 //128/16
 
 __device__ __host__ int myHashFunc(KeyT value, int threshold) {
     //BKDR hash
@@ -81,21 +88,14 @@ struct myHashTable {
         int hashvalue = myHashFunc(key, bNum);
         int my_bucket_size = bCount[hashvalue];
         KeyT* list = keys + (int64_t)hashvalue*bSize;
-        assert((int64_t)list % 16 == 0);
-        int lane_id = threadIdx.x%32;
+
         int my_matched = 0;
         int any_matched = 0;
         KeyT nullKey(-1, -1);
         int64_t result = -1;
 
-        //int warp_id = (threadIdx.x + blockIdx.x*blockDim.x)/32;
-        //if (lane_id == 0)
-        //    key.print(-1*hashvalue);
-
-        for (int i = lane_id; i < (my_bucket_size+31)/32*32; i += 32) {
+        for (int i = threadIdx.x%32; i < (my_bucket_size+31)/32*32; i += 32) {
             KeyT myKey = i < my_bucket_size ? list[i] : nullKey;
-
-            //myKey.print(warp_id);
             
             my_matched = (myKey == key) ? 1 : 0;
             any_matched = __ballot_sync(0xffffffff, my_matched);
@@ -172,13 +172,13 @@ bool buildHashTable(myHashTable &ht, KeyT* all_keys, ValueT* all_values, int buc
     CUDA_TRY(cudaEventElapsedTime(&esp_time_gpu, start, stop));
     printf("Time for build_hashtable_kernel is: %f ms\n", esp_time_gpu);
 
-    /*int* h_hash_count = new int[bucket_num];
+    int* h_hash_count = new int[bucket_num];
     cudaMemcpy(h_hash_count, ht.bCount, sizeof(int)*bucket_num, cudaMemcpyDeviceToHost);
     for (int i = 0; i < bucket_num; i ++)
         printf("%d ", h_hash_count[i]);
     printf("\n");
 
-    KeyT *h_keys = new KeyT[bucket_num*bucket_size];
+    /*KeyT *h_keys = new KeyT[bucket_num*bucket_size];
     cudaMemcpy(h_keys, ht.keys, sizeof(KeyT)*bucket_size*bucket_num, cudaMemcpyDeviceToHost);
     printf("here is the bucket:\n");
     for (int i = 0; i < bucket_num; i ++) {
@@ -188,8 +188,8 @@ bool buildHashTable(myHashTable &ht, KeyT* all_keys, ValueT* all_values, int buc
         }
     }
     printf("\n");
-    delete [] h_keys;
-    delete [] h_hash_count;*/
+    delete [] h_keys;*/
+    delete [] h_hash_count;
 
 
     //build success check
@@ -215,13 +215,6 @@ __global__ void search_hashtable_kernel(myHashTable ht, KeyT* target_keys, Value
     ValueT* values = ht.values;
     int matched_ele = 0;
     for (int64_t i = warp_id; i < target_key_size; i += (blockDim.x*gridDim.x)/32) {
-
-        //KeyT myKey = target_keys[i];
-        //int32_t *ptr = (int32_t*)myKey.data;
-        //if (lane_id == 0 && (int64_t)myKey.data % 16 != 0)
-        //    printf("warp_id %d lane id %d, i %ld, mykey %lx, %d, %d, %d, %d\n", 
-        //            warp_id, lane_id, i, target_keys + i, ptr[0], ptr[1], ptr[2], ptr[3]);
-        
         int64_t offset = ht.search_key(target_keys[i]);
         if (offset != -1) {
             matched_ele ++;
@@ -264,6 +257,68 @@ int64_t searchInHashTable(myHashTable ht, KeyT* target_keys, ValueT* result_valu
     return matched_num;
 }
 
+__global__ void binary_search_kernel(KeyT* bs_list, ValueT* allValues, int ele_num, 
+                                     KeyT* target_keys, ValueT* result_values, int64_t target_key_size,
+                                     int* match_count) {
+    int tid = threadIdx.x + blockIdx.x*blockDim.x;
+    int result = 0;
+    for (int64_t i = tid; i < target_key_size; i += blockDim.x*gridDim.x) {
+        KeyT my_key = target_keys[i];
+        int s = 0, e = ele_num, mid;
+        while (s < e) {
+            mid = (s+e)/2;
+            if (my_key < bs_list[mid]) {
+                e = mid;
+            } else if (my_key == bs_list[mid]){
+                result ++;
+                for (int b = 0; b < ValueBytes; b ++) 
+                    result_values[i].data[b] = allValues[mid].data[b];
+                break;
+            } else {
+                s = mid + 1;
+            }
+        }
+    }
+    result += __shfl_down_sync(0xffffffff, result, 16);
+    result += __shfl_down_sync(0xffffffff, result, 8);
+    result += __shfl_down_sync(0xffffffff, result, 4);
+    result += __shfl_down_sync(0xffffffff, result, 2);
+    result += __shfl_down_sync(0xffffffff, result, 1);
+    if (threadIdx.x%32 == 0) {
+        match_count[tid/32] = result;
+    }
+    return ;
+}
+
+
+int64_t binarySearch(KeyT* bs_list, ValueT* all_values, int ele_num, 
+                     KeyT* target_keys, ValueT* result_values, int64_t target_key_size){
+    int block_size = 256;
+    int block_num = 2048;
+    int* match_count;
+    CUDA_TRY(cudaMalloc((void **)&match_count, sizeof(int)*block_size/32*block_num));
+    CUDA_TRY(cudaMemset(match_count, 0, sizeof(int)*block_size/32*block_num));
+
+    cudaEvent_t start, stop;
+    float esp_time_gpu;
+    CUDA_TRY(cudaEventCreate(&start));
+    CUDA_TRY(cudaEventCreate(&stop));
+    CUDA_TRY(cudaEventRecord(start, 0));
+
+    binary_search_kernel<<<block_num, block_size>>>(bs_list, all_values, ele_num, 
+                                                    target_keys, result_values, target_key_size, match_count);
+    CUDA_TRY(cudaDeviceSynchronize());
+
+    CUDA_TRY(cudaEventRecord(stop, 0));
+    CUDA_TRY(cudaEventSynchronize(stop));
+    CUDA_TRY(cudaEventElapsedTime(&esp_time_gpu, start, stop));
+    printf("Time for binary_search_kernel is: %f ms, where target key size is %ld\n", esp_time_gpu, target_key_size);
+
+    int64_t result = thrust::reduce(thrust::device, match_count, match_count + block_size*block_num/32);
+    CUDA_TRY(cudaFree(match_count));
+    return result;
+}
+
 int main(int argc, char **argv) {
     //adjustable parameters
     float avg2cacheline = 0.8;
@@ -271,7 +326,7 @@ int main(int argc, char **argv) {
     float matches2allsearch = 0.2;
 
     int ele_num = 100000;
-    int64_t target_key_size = 128 * 1024UL;
+    int64_t target_key_size = 1024*1024UL;
 
     int cacheline_size = 128/sizeof(KeyT);
     int avg_size = cacheline_size*avg2cacheline;
@@ -287,7 +342,6 @@ int main(int argc, char **argv) {
     CUDA_TRY(cudaMalloc((void **)&all_keys, sizeof(KeyT)*ele_num));
     CUDA_TRY(cudaMalloc((void **)&all_values, sizeof(ValueT)*ele_num));
 
-
     void *k = (void *)all_keys, *v = (void *)all_values;
     thrust::sequence(thrust::device, (int*)k, (int*)k + sizeof(KeyT)/4*ele_num, 0);
     thrust::sequence(thrust::device, (int*)v, (int*)v + sizeof(ValueT)/4*ele_num, 0);
@@ -295,6 +349,7 @@ int main(int argc, char **argv) {
     thrust::shuffle(thrust::device, (int*)k, (int*)k + sizeof(KeyT)/4*ele_num, g);
     thrust::shuffle(thrust::device, (int*)v, (int*)v + sizeof(KeyT)/4*ele_num, g);
 
+    //********print the list to be searched************
     /*int* h_all_keys = new int[sizeof(KeyT)/4*ele_num];
     cudaMemcpy(h_all_keys, (int*)all_keys, sizeof(KeyT)*ele_num, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
@@ -303,22 +358,12 @@ int main(int argc, char **argv) {
     printf("\n");
     delete [] h_all_keys;*/
 
-    myHashTable ht;
-
-    //build hash table
-    while(!buildHashTable(ht, all_keys, all_values, bucket_num, bucket_size, ele_num)) {
-        bucket_size = 2*bucket_size;
-        printf("Build hash table failed! The avg2bsize is %f now. Rebuilding... ...\n", avg2bsize);
-    }
-
-    //generate search keys
+     //generate search keys
     printf("start generating search keys...\n");
     KeyT* target_keys;
     ValueT* result_values;
     CUDA_TRY(cudaMalloc((void **)&target_keys, sizeof(KeyT)*target_key_size));
     CUDA_TRY(cudaMalloc((void **)&result_values, sizeof(ValueT)*target_key_size));
-    
-
 
     int64_t copy_from_ht_num = target_key_size*matches2allsearch;
     int64_t random_gen_num = target_key_size - copy_from_ht_num;
@@ -341,6 +386,7 @@ int main(int argc, char **argv) {
 
     thrust::shuffle(thrust::device, target_keys, target_keys + target_key_size, g);
     
+    //*******print the target_keys**********
     /*int* h_target_keys = new int[sizeof(KeyT)/4*target_key_size];
     cudaMemcpy(h_target_keys, (int*)target_keys, sizeof(KeyT)*target_key_size, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
@@ -355,6 +401,26 @@ int main(int argc, char **argv) {
     delete [] h_target_keys;
     random_gen_num /= sizeof(KeyT)/4;
     copy_from_ht_num /= sizeof(KeyT)/4;*/
+#ifdef BINARY_SEARCH
+    KeyT* bs_list;
+    CUDA_TRY(cudaMalloc((void **)&bs_list, sizeof(KeyT)*ele_num));
+    CUDA_TRY(cudaMemcpy(bs_list, all_keys, sizeof(KeyT)*ele_num, cudaMemcpyDeviceToDevice));
+    CUDA_TRY(cudaDeviceSynchronize());
+    thrust::sort(thrust::device, bs_list, bs_list+ele_num);
+    int64_t bs_result = binarySearch(bs_list, all_values, ele_num, target_keys, result_values, target_key_size);
+    if (bs_result == copy_from_ht_num)
+        printf("quick validation for binary search PASSED!\n\n");
+    else 
+        printf("quick validation for binary search FAILED! results is %ld, should be %ld\n\n", bs_result, copy_from_ht_num);
+#endif
+
+    myHashTable ht;
+
+    //build hash table
+    while(!buildHashTable(ht, all_keys, all_values, bucket_num, bucket_size, ele_num)) {
+        bucket_size = 2*bucket_size;
+        printf("Build hash table failed! The avg2bsize is %f now. Rebuilding... ...\n", avg2bsize);
+    }
 
     //search in the hash table
     int64_t results = searchInHashTable(ht, target_keys, result_values, target_key_size);
@@ -363,7 +429,9 @@ int main(int argc, char **argv) {
     else 
         printf("quick validation for hash table FAILED! results is %ld, should be %ld\n", results, copy_from_ht_num);
 
-
+#ifdef BINARY_SEARCH
+    CUDA_TRY(cudaFree(bs_list));
+#endif
     CUDA_TRY(cudaFree(all_keys));
     CUDA_TRY(cudaFree(all_values));
     CUDA_TRY(cudaFree(target_keys));
