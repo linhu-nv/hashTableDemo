@@ -52,6 +52,9 @@ struct ValueT{
 
 #define ValueBytes 32
 #define cg_size 8 //128/16
+//#define get_my_mask(x) (unsigned int)0xff<<((32+7-x)/8*8-8)
+#define get_my_mask(x) 0xff<<(x/8*8)
+//#define get_my_mask(x) 0xf<<((32+3-x)/4*4-4)
 
 __device__ __host__ int myHashFunc(KeyT value, int threshold) {
     //BKDR hash
@@ -84,7 +87,7 @@ struct myHashTable {
     int* bCount;
     int bNum;
     int bSize;
-    __device__ int64_t search_key(KeyT key) {
+    __inline__ __device__ int64_t search_key(KeyT key, int index) {
         int hashvalue = myHashFunc(key, bNum);
         int my_bucket_size = bCount[hashvalue];
         KeyT* list = keys + (int64_t)hashvalue*bSize;
@@ -94,13 +97,18 @@ struct myHashTable {
         KeyT nullKey(-1, -1);
         int64_t result = -1;
 
-        for (int i = threadIdx.x%32; i < (my_bucket_size+31)/32*32; i += 32) {
+        int lane_id = threadIdx.x%32;
+
+        int aligned_size = (my_bucket_size+cg_size-1)/cg_size*cg_size;
+        for (int i = threadIdx.x%cg_size; i < aligned_size; i += cg_size) {
+            //printf("%d %d\n", i, aligned_size);
             KeyT myKey = i < my_bucket_size ? list[i] : nullKey;
-            
             my_matched = (myKey == key) ? 1 : 0;
-            any_matched = __ballot_sync(0xffffffff, my_matched);
+            //NOTE: it is reversal! 31 30 29 28 27 26 ... 0
+            //any_matched = __ballot_sync(__activemask(), my_matched) & get_my_mask(lane_id);
+            any_matched = __ballot_sync(get_my_mask(lane_id), my_matched);
             if (any_matched) {
-                result = hashvalue*bSize + __ffs(any_matched); 
+                result = hashvalue*bSize + i/cg_size*cg_size + __ffs(any_matched)%cg_size; 
                 break;
             }
         }
@@ -172,7 +180,7 @@ bool buildHashTable(myHashTable &ht, KeyT* all_keys, ValueT* all_values, int buc
     CUDA_TRY(cudaEventElapsedTime(&esp_time_gpu, start, stop));
     printf("Time for build_hashtable_kernel is: %f ms\n", esp_time_gpu);
 
-    int* h_hash_count = new int[bucket_num];
+    /*int* h_hash_count = new int[bucket_num];
     cudaMemcpy(h_hash_count, ht.bCount, sizeof(int)*bucket_num, cudaMemcpyDeviceToHost);
     for (int i = 0; i < bucket_num; i ++)
         printf("%d ", h_hash_count[i]);
@@ -188,8 +196,8 @@ bool buildHashTable(myHashTable &ht, KeyT* all_keys, ValueT* all_values, int buc
         }
     }
     printf("\n");
-    delete [] h_keys;*/
-    delete [] h_hash_count;
+    delete [] h_keys;
+    delete [] h_hash_count;*/
 
 
     //build success check
@@ -210,22 +218,27 @@ bool buildHashTable(myHashTable &ht, KeyT* all_keys, ValueT* all_values, int buc
 }
 
 __global__ void search_hashtable_kernel(myHashTable ht, KeyT* target_keys, ValueT* result_values, int64_t target_key_size, int* matched_count) {
-    int warp_id = (threadIdx.x + blockIdx.x * blockDim.x)/32;
-    int lane_id = threadIdx.x%32;
+    int tile_id = (threadIdx.x + blockIdx.x * blockDim.x)/cg_size;
+    int tile_lane_id = threadIdx.x%cg_size;
     ValueT* values = ht.values;
     int matched_ele = 0;
-    for (int64_t i = warp_id; i < target_key_size; i += (blockDim.x*gridDim.x)/32) {
-        int64_t offset = ht.search_key(target_keys[i]);
+    for (int64_t i = tile_id; i < target_key_size; i += (blockDim.x*gridDim.x)/cg_size) {
+        int64_t offset = ht.search_key(target_keys[i], i);
         if (offset != -1) {
             matched_ele ++;
+            //if (tile_lane_id == 0)
+            //    target_keys[i].print(-1*i);
             //output result values
-            for (int b = lane_id; b < ValueBytes; b += 32) {
+            for (int b = tile_lane_id; b < ValueBytes; b += cg_size) {
                 result_values[i].data[b] = values[offset].data[b];
             }
         }
     }
-    if (lane_id == 0)
-        matched_count[warp_id] = matched_ele;
+    //NOTE: this change with the cg_size!
+    matched_ele += __shfl_down_sync(0xffffffff, matched_ele, 8);
+    matched_ele += __shfl_down_sync(0xffffffff, matched_ele, 16);
+    if (threadIdx.x%32 == 0)
+        matched_count[tile_id*cg_size/32] = matched_ele;
     return ;
 }
 
@@ -326,7 +339,7 @@ int main(int argc, char **argv) {
     float matches2allsearch = 0.2;
 
     int ele_num = 100000;
-    int64_t target_key_size = 1024*1024UL;
+    int64_t target_key_size = 1024UL * 1024UL;
 
     int cacheline_size = 128/sizeof(KeyT);
     int avg_size = cacheline_size*avg2cacheline;
@@ -401,6 +414,7 @@ int main(int argc, char **argv) {
     delete [] h_target_keys;
     random_gen_num /= sizeof(KeyT)/4;
     copy_from_ht_num /= sizeof(KeyT)/4;*/
+
 #ifdef BINARY_SEARCH
     KeyT* bs_list;
     CUDA_TRY(cudaMalloc((void **)&bs_list, sizeof(KeyT)*ele_num));
@@ -418,7 +432,7 @@ int main(int argc, char **argv) {
 
     //build hash table
     while(!buildHashTable(ht, all_keys, all_values, bucket_num, bucket_size, ele_num)) {
-        bucket_size = 2*bucket_size;
+        bucket_size = 1.5*bucket_size;
         printf("Build hash table failed! The avg2bsize is %f now. Rebuilding... ...\n", avg2bsize);
     }
 
