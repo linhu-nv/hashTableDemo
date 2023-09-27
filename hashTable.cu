@@ -21,10 +21,10 @@
 struct KeyT{
     char data[16];
     __device__ __host__ KeyT() {}
-    __device__ __host__  KeyT(int64_t v1, int64_t v2) {
+    __device__ __host__  KeyT(int64_t v1) {
         int64_t* ptr = static_cast<int64_t *>((void*)data);
         ptr[0] = v1;
-        ptr[1] = v2;
+        ptr[1] = v1;
     }
     __device__ __host__ bool operator == (const KeyT key) {
         int64_t* d1 = (int64_t *)key.data;
@@ -46,14 +46,41 @@ struct KeyT{
 	    return ;
     }
 };
+
+/*struct KeyT{
+    char data[8];
+    __device__ __host__ KeyT() {}
+    __device__ __host__  KeyT(int64_t v1) {
+        int64_t* ptr = static_cast<int64_t *>((void*)data);
+        ptr[0] = v1;
+    }
+    __device__ __host__ bool operator == (const KeyT key) {
+        int64_t* d1 = (int64_t *)key.data;
+        int64_t* _d1 = (int64_t *)data;
+        return d1[0] == _d1[0];
+    }
+    __device__ __host__ bool operator < (const KeyT key) const {
+        int64_t* d1 = (int64_t *)key.data;
+        int64_t* _d1 = (int64_t *)data;
+        return _d1[0] < d1[0];
+    }
+    __device__ __host__ void print(int matched) {
+	    int* ptr = (int*)data;
+	    printf("%d %d is %d\n", ptr[0], ptr[1], matched);
+	    return ;
+    }
+};*/
+
 struct ValueT{
     char data[32];
 };
 
 #define ValueBytes 32
+//#define cg_size 16//128/16
 #define cg_size 8//128/16
 //#define cg_size 4
 #define get_my_mask(x) 0xff<<(x/8*8)
+//#define get_my_mask(x) 0xffff<<(x/16*16)
 //#define get_my_mask(x) 0xf<<(x/4*4)
 
 
@@ -95,7 +122,7 @@ struct myHashTable {
 
         int my_matched = 0;
         int any_matched = 0;
-        KeyT nullKey(-1, -1);
+        KeyT nullKey(-1);
         int64_t result = -1;
 
         int lane_id = threadIdx.x%32;
@@ -184,6 +211,7 @@ bool buildHashTable(myHashTable &ht, KeyT* all_keys, ValueT* all_values, int buc
     for (int i = 0; i < bucket_num; i ++)
         printf("%d ", h_hash_count[i]);
     printf("\n");
+    delete [] h_hash_count;*/
 
     /*KeyT *h_keys = new KeyT[bucket_num*bucket_size];
     cudaMemcpy(h_keys, ht.keys, sizeof(KeyT)*bucket_size*bucket_num, cudaMemcpyDeviceToHost);
@@ -195,8 +223,8 @@ bool buildHashTable(myHashTable &ht, KeyT* all_keys, ValueT* all_values, int buc
         }
     }
     printf("\n");
-    delete [] h_keys;
-    delete [] h_hash_count;*/
+    delete [] h_keys;*/
+    
 
 
     //build success check
@@ -232,9 +260,8 @@ __global__ void search_hashtable_kernel(myHashTable ht, KeyT* target_keys, Value
         }
     }
     //NOTE: this change with the cg_size!
-    if (cg_size <= 4)
-        matched_ele += __shfl_down_sync(0xffffffff, matched_ele, 4);
-    matched_ele += __shfl_down_sync(0xffffffff, matched_ele, 8);
+    if (cg_size <= 4)   matched_ele += __shfl_down_sync(0xffffffff, matched_ele, 4);
+    if (cg_size <= 8)   matched_ele += __shfl_down_sync(0xffffffff, matched_ele, 8);
     matched_ele += __shfl_down_sync(0xffffffff, matched_ele, 16);
     if (threadIdx.x%32 == 0)
         matched_count[tile_id*cg_size/32] = matched_ele;
@@ -338,7 +365,7 @@ int main(int argc, char **argv) {
     float matches2allsearch = 0.2;
 
     int ele_num = 100000;
-    int64_t target_key_size = 1024UL * 1024UL;
+    int64_t target_key_size =  10 *1024UL * 1024UL;
 
     int cacheline_size = 128/sizeof(KeyT);
     int avg_size = cacheline_size*avg2cacheline;
@@ -431,7 +458,7 @@ int main(int argc, char **argv) {
 
     //build hash table
     while(!buildHashTable(ht, all_keys, all_values, bucket_num, bucket_size, ele_num)) {
-        bucket_size = 1.5*bucket_size;
+        bucket_size = 1.2*bucket_size;
         printf("Build hash table failed! The avg2bsize is %f now. Rebuilding... ...\n", avg2bsize);
     }
 
