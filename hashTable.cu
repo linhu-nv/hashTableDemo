@@ -18,6 +18,10 @@
     }                                                                           \
   } while (0)
 
+//#define KEYBYTE16
+#define KEYBYTE8
+
+#ifdef KEYBYTE16
 struct KeyT{
     char data[16];
     __device__ __host__ KeyT() {}
@@ -46,8 +50,10 @@ struct KeyT{
 	    return ;
     }
 };
-
-/*struct KeyT{
+#define get_my_mask(x) 0xff<<(x/8*8)
+#endif
+#ifdef KEYBYTE8
+struct KeyT{
     char data[8];
     __device__ __host__ KeyT() {}
     __device__ __host__  KeyT(int64_t v1) {
@@ -69,32 +75,32 @@ struct KeyT{
 	    printf("%d %d is %d\n", ptr[0], ptr[1], matched);
 	    return ;
     }
-};*/
-
+};
+#define get_my_mask(x) 0xf<<(x/4*4)
+#endif
 struct ValueT{
     char data[32];
 };
 
 #define ValueBytes 32
-//#define cg_size 16//128/16
-#define cg_size 8//128/16
-//#define cg_size 4
-#define get_my_mask(x) 0xff<<(x/8*8)
+#define cg_size (sizeof(KeyT)/2)
+//#define cg_size 8//128/16
 //#define get_my_mask(x) 0xffff<<(x/16*16)
-//#define get_my_mask(x) 0xf<<(x/4*4)
 
 
 __device__ __host__ int myHashFunc(KeyT value, int threshold) {
     //BKDR hash
-    /*uint32_t seed = 31;
-    uint32_t hash = 0;
-    while(value) {
-        hash = hash * seed + (value&0xF);
-        value >>= 4;
+    uint32_t seed = 31;
+    char* values = static_cast<char*>(value.data);
+    int len = sizeof(KeyT);
+    uint32_t hash = 171;
+    while(len--) {
+        char v = (~values[len-1])*(len&1) + (values[len-1])*(~(len&1));
+        hash = hash * seed + (v&0xF);
     }
-    return (hash & 0x7FFFFFFF) % threshold;*/
+    return (hash & 0x7FFFFFFF) % threshold;
     //AP hash
-    unsigned int hash = 0;
+    /*unsigned int hash = 0;
     int len = sizeof(KeyT);
     char* values = static_cast<char*>(value.data);
     for (int i = 0; i < len; i++) {
@@ -104,7 +110,7 @@ __device__ __host__ int myHashFunc(KeyT value, int threshold) {
             hash ^= (~((hash << 11) ^ (values[i]&0xF) ^ (hash >> 5)));
         }
     }
-    return (hash & 0x7FFFFFFF)%threshold;
+    return (hash & 0x7FFFFFFF)%threshold;*/
     //return ((value & 0xff)+((value>>8) & 0xff)+((value>>16) &0xff)+((value >> 24)&0xff))%threshold;
 
 }
@@ -458,7 +464,7 @@ int main(int argc, char **argv) {
 
     //build hash table
     while(!buildHashTable(ht, all_keys, all_values, bucket_num, bucket_size, ele_num)) {
-        bucket_size = 1.2*bucket_size;
+        bucket_size = 1.4*bucket_size;
         printf("Build hash table failed! The avg2bsize is %f now. Rebuilding... ...\n", avg2bsize);
     }
 
