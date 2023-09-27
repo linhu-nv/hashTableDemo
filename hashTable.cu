@@ -51,10 +51,11 @@ struct ValueT{
 };
 
 #define ValueBytes 32
-#define cg_size 8 //128/16
-//#define get_my_mask(x) (unsigned int)0xff<<((32+7-x)/8*8-8)
+#define cg_size 8//128/16
+//#define cg_size 4
 #define get_my_mask(x) 0xff<<(x/8*8)
-//#define get_my_mask(x) 0xf<<((32+3-x)/4*4-4)
+//#define get_my_mask(x) 0xf<<(x/4*4)
+
 
 __device__ __host__ int myHashFunc(KeyT value, int threshold) {
     //BKDR hash
@@ -101,12 +102,10 @@ struct myHashTable {
 
         int aligned_size = (my_bucket_size+cg_size-1)/cg_size*cg_size;
         for (int i = threadIdx.x%cg_size; i < aligned_size; i += cg_size) {
-            //printf("%d %d\n", i, aligned_size);
             KeyT myKey = i < my_bucket_size ? list[i] : nullKey;
             my_matched = (myKey == key) ? 1 : 0;
             //NOTE: it is reversal! 31 30 29 28 27 26 ... 0
-            //any_matched = __ballot_sync(__activemask(), my_matched) & get_my_mask(lane_id);
-            any_matched = __ballot_sync(get_my_mask(lane_id), my_matched);
+            any_matched = __ballot_sync(__activemask(), my_matched) & get_my_mask(lane_id);
             if (any_matched) {
                 result = hashvalue*bSize + i/cg_size*cg_size + __ffs(any_matched)%cg_size; 
                 break;
@@ -226,8 +225,6 @@ __global__ void search_hashtable_kernel(myHashTable ht, KeyT* target_keys, Value
         int64_t offset = ht.search_key(target_keys[i], i);
         if (offset != -1) {
             matched_ele ++;
-            //if (tile_lane_id == 0)
-            //    target_keys[i].print(-1*i);
             //output result values
             for (int b = tile_lane_id; b < ValueBytes; b += cg_size) {
                 result_values[i].data[b] = values[offset].data[b];
@@ -235,6 +232,8 @@ __global__ void search_hashtable_kernel(myHashTable ht, KeyT* target_keys, Value
         }
     }
     //NOTE: this change with the cg_size!
+    if (cg_size <= 4)
+        matched_ele += __shfl_down_sync(0xffffffff, matched_ele, 4);
     matched_ele += __shfl_down_sync(0xffffffff, matched_ele, 8);
     matched_ele += __shfl_down_sync(0xffffffff, matched_ele, 16);
     if (threadIdx.x%32 == 0)
@@ -334,8 +333,8 @@ int64_t binarySearch(KeyT* bs_list, ValueT* all_values, int ele_num,
 
 int main(int argc, char **argv) {
     //adjustable parameters
-    float avg2cacheline = 0.8;
-    float avg2bsize = 0.5;
+    float avg2cacheline = 0.7;
+    float avg2bsize = 0.55;
     float matches2allsearch = 0.2;
 
     int ele_num = 100000;
@@ -347,7 +346,7 @@ int main(int argc, char **argv) {
     int bucket_num = (ele_num + avg_size - 1)/avg_size;
     printf("bucket_size %d, bucket_num %d, avg_size %d\n", bucket_size, bucket_num, avg_size);
 
-    bucket_size = bucket_size < 20 ? 20 : bucket_size;
+    //bucket_size = bucket_size < 20 ? 20 : bucket_size;
 
     //generate random key-value pairs
     KeyT* all_keys;
